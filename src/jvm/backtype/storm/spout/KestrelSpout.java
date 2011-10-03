@@ -1,10 +1,11 @@
 package backtype.storm.spout;
 
-import backtype.storm.spout.KestrelClient.ParseError;
 import backtype.storm.task.TopologyContext;
 import backtype.storm.topology.IRichSpout;
 import backtype.storm.topology.OutputFieldsDeclarer;
 import java.io.*;
+import java.util.Set;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.List;
 import backtype.storm.tuple.Fields;
@@ -12,6 +13,9 @@ import backtype.storm.utils.Utils;
 import java.util.ArrayList;
 import java.util.Arrays;
 import org.apache.log4j.Logger;
+import org.apache.thrift.TException;
+import net.lag.kestrel.thrift.Item;
+import net.lag.kestrel.ThriftClient;
 
 
 /**
@@ -46,7 +50,7 @@ public class KestrelSpout implements IRichSpout {
     }
     
     private static class KestrelClientInfo {
-        public KestrelClient client;
+        public ThriftClient client;
         public Long blacklistTillTimeMs;
         public String host;
         public int port;
@@ -103,14 +107,10 @@ public class KestrelSpout implements IRichSpout {
     }
 
     public void close() {
-        try {
-            for(KestrelClientInfo info: _kestrels) {
-                if(info.client!=null) {
-                    info.client.close();
-                }
+        for(KestrelClientInfo info: _kestrels) {
+            if(info.client!=null) {
+                info.client.close();
             }
-        } catch( IOException e ) {
-            throw new RuntimeException(e);
         }
         _kestrels.clear();
     }
@@ -124,19 +124,20 @@ public class KestrelSpout implements IRichSpout {
             if(now > info.blacklistTillTimeMs) {
                 try {
                     if(info.client==null) {
-                        info.client = new KestrelClient(info.host, info.port);
+                        info.client = new ThriftClient(info.host, info.port);
                     }
-                    KestrelClient.Item item = info.client.dequeue(_queueName);
-                    if(item!=null) {
-                        List<Object> tuple = _scheme.deserialize(item._data);
-                        _collector.emit(tuple, new KestrelSourceId(index, item._id));
+                    List<Item> items = info.client.get(_queueName, 1, 0, false);
+
+                    if(!items.isEmpty()) {
+                        assert items.size() == 1;
+                        Item item = items.get(0);
+                        List<Object> tuple = _scheme.deserialize(item.get_data());
+                        _collector.emit(tuple, new KestrelSourceId(index, item.get_xid()));
                         success = true;
                         _emitIndex = index;
                         break;
                     }
-                } catch(IOException ioe) {
-                    blacklist(info, ioe);
-                } catch(ParseError e) {
+                } catch(TException e) {
                     blacklist(info, e);
                     
                 }
@@ -150,13 +151,9 @@ public class KestrelSpout implements IRichSpout {
     
     private void blacklist(KestrelClientInfo info, Throwable t) {
         LOG.warn("Failed to read from Kestrel at " + info.host + ":" + info.port, t);
-        try {
-          //this case can happen when it fails to connect to Kestrel (and so never stores the connection)
-          if(info.client!=null) {
+        //this case can happen when it fails to connect to Kestrel (and so never stores the connection)
+        if(info.client!=null) {
             info.client.close();
-          }
-        } catch (IOException ex) {
-            LOG.warn("Failed to close Kestrel client at " + info.host + ":" + info.port, t);
         }
         info.client = null;
         info.blacklistTillTimeMs = System.currentTimeMillis() + BLACKLIST_TIME_MS;
@@ -171,11 +168,11 @@ public class KestrelSpout implements IRichSpout {
         //back on the queue
         try {
             if(info.client!=null) {
-                info.client.ack(_queueName, sourceId.id);
+                HashSet xids = new HashSet();
+                xids.add(sourceId.id);
+                info.client.confirm(_queueName, xids);
             }
-        } catch(IOException ioe) {
-            blacklist(info, ioe);
-        } catch(ParseError e) {
+        } catch(TException e) {
             blacklist(info, e);            
         }
     }
@@ -187,11 +184,11 @@ public class KestrelSpout implements IRichSpout {
         // see not above about why this works with blacklisting strategy
         try {
             if(info.client!=null) {
-                info.client.fail(_queueName, sourceId.id);
+                HashSet xids = new HashSet();
+                xids.add(sourceId.id);
+                info.client.abort(_queueName, xids);
             }
-        } catch(IOException ioe) {
-            blacklist(info, ioe);
-        } catch(ParseError e) {
+        } catch(TException e) {
             blacklist(info, e);            
         }
     }
