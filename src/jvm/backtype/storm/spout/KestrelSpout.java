@@ -8,6 +8,9 @@ import java.util.Set;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.List;
+import java.util.Iterator;
+import java.util.Queue;
+import java.util.LinkedList;
 import backtype.storm.tuple.Fields;
 import backtype.storm.utils.Utils;
 import java.util.ArrayList;
@@ -28,6 +31,7 @@ public class KestrelSpout implements IRichSpout {
     public static Logger LOG = Logger.getLogger(KestrelSpout.class);
 
     public static final long BLACKLIST_TIME_MS = 1000 * 60;
+    public static final int BATCH_SIZE = 500;
     
     
     private List<String> _hosts = null;
@@ -38,6 +42,18 @@ public class KestrelSpout implements IRichSpout {
 
     private List<KestrelClientInfo> _kestrels;
     private int _emitIndex;
+
+    private Queue<EmitItem> _emitBuffer = new LinkedList<EmitItem>();
+
+    private class EmitItem {
+        public KestrelSourceId sourceId;
+        public List<Object> tuple;
+
+        public EmitItem(List<Object> tuple, KestrelSourceId sourceId) {
+            this.tuple = tuple;
+            this.sourceId = sourceId;
+        }
+    }
     
     private static class KestrelSourceId {
         public KestrelSourceId(int index, int id) {
@@ -50,16 +66,32 @@ public class KestrelSpout implements IRichSpout {
     }
     
     private static class KestrelClientInfo {
-        public ThriftClient client;
         public Long blacklistTillTimeMs;
         public String host;
         public int port;
+
+        private ThriftClient client;
         
         public KestrelClientInfo(String host, int port) {
             this.host = host;
             this.port = port;
             this.blacklistTillTimeMs = 0L;
             this.client  = null;
+        }
+
+        public ThriftClient getValidClient() throws TException {
+            if(this.client==null) { // If client was blacklisted, remake it.
+                LOG.info("Attempting reconnect to kestrel " + this.host + ":" + this.port);
+                this.client = new ThriftClient(this.host, this.port);
+            }
+            return this.client;
+        }
+
+        public void closeClient() {
+            if(this.client != null) {
+                this.client.close();
+                this.client = null;
+            }
         }
     }
     
@@ -107,56 +139,79 @@ public class KestrelSpout implements IRichSpout {
     }
 
     public void close() {
-        for(KestrelClientInfo info: _kestrels) {
-            if(info.client!=null) {
-                info.client.close();
-            }
-        }
+        for(KestrelClientInfo info: _kestrels) info.closeClient();
+
+        // Closing the client connection causes all the open reliable reads to be aborted. 
+        // Thus, clear our local buffer of these reliable reads.
+        _emitBuffer.clear();
+
         _kestrels.clear();
     }
 
-    public void nextTuple() {
+    public boolean bufferKestrelGet(int index) {
+        assert _emitBuffer.size() == 0; // JTODO
+
+        KestrelClientInfo info = _kestrels.get(index);
+
         long now = System.currentTimeMillis();
-        boolean success = false;
+        if(now > info.blacklistTillTimeMs) {
+            List<Item> items = null;
+            try {
+                items = info.getValidClient().get(_queueName, BATCH_SIZE, 0, false);
+            } catch(TException e) {
+                blacklist(info, e);
+                return false;
+            }
+
+            assert items.size() <= BATCH_SIZE;
+            LOG.info("Kestrel batch get fetched " + items.size() + " items. (batchSize= " + BATCH_SIZE + 
+                     " queueName=" + _queueName + ", index=" + index + ", host=" + info.host + ")");
+
+            for(Item item : items) {
+                List<Object> tuple = _scheme.deserialize(item.get_data());
+                EmitItem emitItem = new EmitItem(_scheme.deserialize(item.get_data()),
+                                                 new KestrelSourceId(index, item.get_xid()));
+                assert _emitBuffer.offer(emitItem) == true;
+            }
+
+            if(items.size() > 0) return true;
+        }
+        return false;
+    }
+
+    public void tryEachKestrelUntilBufferFilled() {
         for(int i=0; i<_kestrels.size(); i++) {
             int index = (_emitIndex + i) % _kestrels.size();
-            KestrelClientInfo info = _kestrels.get(index);
-            if(now > info.blacklistTillTimeMs) {
-                try {
-                    if(info.client==null) {
-                        info.client = new ThriftClient(info.host, info.port);
-                    }
-                    List<Item> items = info.client.get(_queueName, 1, 0, false);
-
-                    if(!items.isEmpty()) {
-                        assert items.size() == 1;
-                        Item item = items.get(0);
-                        List<Object> tuple = _scheme.deserialize(item.get_data());
-                        _collector.emit(tuple, new KestrelSourceId(index, item.get_xid()));
-                        success = true;
-                        _emitIndex = index;
-                        break;
-                    }
-                } catch(TException e) {
-                    blacklist(info, e);
-                    
-                }
-            }            
+            if(bufferKestrelGet(index)) break;
         }
         _emitIndex = (_emitIndex + 1) % _kestrels.size();
-        if(!success) {
-            Utils.sleep(10);
+    }
+
+    public void nextTuple() {
+        if(_emitBuffer.isEmpty()) tryEachKestrelUntilBufferFilled();
+
+        EmitItem item = _emitBuffer.poll();
+        if(item != null) { 
+            _collector.emit(item.tuple, item.sourceId);
+        } else {  // If buffer is still empty here, then every kestrel Q is also empty.
+            Utils.sleep(10); 
         }
     }
-    
+
     private void blacklist(KestrelClientInfo info, Throwable t) {
         LOG.warn("Failed to read from Kestrel at " + info.host + ":" + info.port, t);
+
         //this case can happen when it fails to connect to Kestrel (and so never stores the connection)
-        if(info.client!=null) {
-            info.client.close();
-        }
-        info.client = null;
+        info.closeClient();
         info.blacklistTillTimeMs = System.currentTimeMillis() + BLACKLIST_TIME_MS;
+
+        int index = _kestrels.indexOf(info);
+
+        // we just closed the connection, so all open reliable reads will be aborted. empty buffers.
+        for(Iterator<EmitItem> i = _emitBuffer.iterator(); i.hasNext();) {
+            EmitItem item = i.next();
+            if(item.sourceId.index == index) i.remove();
+        }
     }
 
     public void ack(Object msgId) {
