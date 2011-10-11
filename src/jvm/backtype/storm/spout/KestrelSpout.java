@@ -168,10 +168,11 @@ public class KestrelSpout implements IRichSpout {
                      " queueName=" + _queueName + ", index=" + index + ", host=" + info.host + ")");
 
             for(Item item : items) {
-                List<Object> tuple = _scheme.deserialize(item.get_data());
                 EmitItem emitItem = new EmitItem(_scheme.deserialize(item.get_data()),
                                                  new KestrelSourceId(index, item.get_xid()));
-                assert _emitBuffer.offer(emitItem) == true;
+                if(!_emitBuffer.offer(emitItem)) {
+                    throw new RuntimeException("KestrelSpout's Internal Buffer Enqeueue Failed.");
+                }
             }
 
             if(items.size() > 0) return true;
@@ -182,7 +183,10 @@ public class KestrelSpout implements IRichSpout {
     public void tryEachKestrelUntilBufferFilled() {
         for(int i=0; i<_kestrels.size(); i++) {
             int index = (_emitIndex + i) % _kestrels.size();
-            if(bufferKestrelGet(index)) break;
+            if(bufferKestrelGet(index)) {
+                _emitIndex = index;
+                break;
+            }
         }
         _emitIndex = (_emitIndex + 1) % _kestrels.size();
     }
