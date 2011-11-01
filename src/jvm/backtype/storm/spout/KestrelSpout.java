@@ -1,17 +1,24 @@
 package backtype.storm.spout;
 
-import backtype.storm.spout.KestrelClient.ParseError;
 import backtype.storm.task.TopologyContext;
 import backtype.storm.topology.IRichSpout;
 import backtype.storm.topology.OutputFieldsDeclarer;
 import java.io.*;
+import java.util.Set;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.List;
+import java.util.Iterator;
+import java.util.Queue;
+import java.util.LinkedList;
 import backtype.storm.tuple.Fields;
 import backtype.storm.utils.Utils;
 import java.util.ArrayList;
 import java.util.Arrays;
 import org.apache.log4j.Logger;
+import org.apache.thrift.TException;
+import net.lag.kestrel.thrift.Item;
+import net.lag.kestrel.ThriftClient;
 
 
 /**
@@ -24,6 +31,7 @@ public class KestrelSpout implements IRichSpout {
     public static Logger LOG = Logger.getLogger(KestrelSpout.class);
 
     public static final long BLACKLIST_TIME_MS = 1000 * 60;
+    public static final int BATCH_SIZE = 500;
     
     
     private List<String> _hosts = null;
@@ -34,6 +42,18 @@ public class KestrelSpout implements IRichSpout {
 
     private List<KestrelClientInfo> _kestrels;
     private int _emitIndex;
+
+    private Queue<EmitItem> _emitBuffer = new LinkedList<EmitItem>();
+
+    private class EmitItem {
+        public KestrelSourceId sourceId;
+        public List<Object> tuple;
+
+        public EmitItem(List<Object> tuple, KestrelSourceId sourceId) {
+            this.tuple = tuple;
+            this.sourceId = sourceId;
+        }
+    }
     
     private static class KestrelSourceId {
         public KestrelSourceId(int index, int id) {
@@ -46,16 +66,32 @@ public class KestrelSpout implements IRichSpout {
     }
     
     private static class KestrelClientInfo {
-        public KestrelClient client;
         public Long blacklistTillTimeMs;
         public String host;
         public int port;
+
+        private ThriftClient client;
         
         public KestrelClientInfo(String host, int port) {
             this.host = host;
             this.port = port;
             this.blacklistTillTimeMs = 0L;
             this.client  = null;
+        }
+
+        public ThriftClient getValidClient() throws TException {
+            if(this.client==null) { // If client was blacklisted, remake it.
+                LOG.info("Attempting reconnect to kestrel " + this.host + ":" + this.port);
+                this.client = new ThriftClient(this.host, this.port);
+            }
+            return this.client;
+        }
+
+        public void closeClient() {
+            if(this.client != null) {
+                this.client.close();
+                this.client = null;
+            }
         }
     }
     
@@ -103,63 +139,83 @@ public class KestrelSpout implements IRichSpout {
     }
 
     public void close() {
-        try {
-            for(KestrelClientInfo info: _kestrels) {
-                if(info.client!=null) {
-                    info.client.close();
-                }
-            }
-        } catch( IOException e ) {
-            throw new RuntimeException(e);
-        }
+        for(KestrelClientInfo info: _kestrels) info.closeClient();
+
+        // Closing the client connection causes all the open reliable reads to be aborted. 
+        // Thus, clear our local buffer of these reliable reads.
+        _emitBuffer.clear();
+
         _kestrels.clear();
     }
 
-    public void nextTuple() {
+    public boolean bufferKestrelGet(int index) {
+        assert _emitBuffer.size() == 0; // JTODO
+
+        KestrelClientInfo info = _kestrels.get(index);
+
         long now = System.currentTimeMillis();
-        boolean success = false;
+        if(now > info.blacklistTillTimeMs) {
+            List<Item> items = null;
+            try {
+                items = info.getValidClient().get(_queueName, BATCH_SIZE, 0, false);
+            } catch(TException e) {
+                blacklist(info, e);
+                return false;
+            }
+
+            assert items.size() <= BATCH_SIZE;
+            LOG.info("Kestrel batch get fetched " + items.size() + " items. (batchSize= " + BATCH_SIZE + 
+                     " queueName=" + _queueName + ", index=" + index + ", host=" + info.host + ")");
+
+            for(Item item : items) {
+                EmitItem emitItem = new EmitItem(_scheme.deserialize(item.get_data()),
+                                                 new KestrelSourceId(index, item.get_xid()));
+                if(!_emitBuffer.offer(emitItem)) {
+                    throw new RuntimeException("KestrelSpout's Internal Buffer Enqeueue Failed.");
+                }
+            }
+
+            if(items.size() > 0) return true;
+        }
+        return false;
+    }
+
+    public void tryEachKestrelUntilBufferFilled() {
         for(int i=0; i<_kestrels.size(); i++) {
             int index = (_emitIndex + i) % _kestrels.size();
-            KestrelClientInfo info = _kestrels.get(index);
-            if(now > info.blacklistTillTimeMs) {
-                try {
-                    if(info.client==null) {
-                        info.client = new KestrelClient(info.host, info.port);
-                    }
-                    KestrelClient.Item item = info.client.dequeue(_queueName);
-                    if(item!=null) {
-                        List<Object> tuple = _scheme.deserialize(item._data);
-                        _collector.emit(tuple, new KestrelSourceId(index, item._id));
-                        success = true;
-                        _emitIndex = index;
-                        break;
-                    }
-                } catch(IOException ioe) {
-                    blacklist(info, ioe);
-                } catch(ParseError e) {
-                    blacklist(info, e);
-                    
-                }
-            }            
+            if(bufferKestrelGet(index)) {
+                _emitIndex = index;
+                break;
+            }
         }
         _emitIndex = (_emitIndex + 1) % _kestrels.size();
-        if(!success) {
-            Utils.sleep(10);
+    }
+
+    public void nextTuple() {
+        if(_emitBuffer.isEmpty()) tryEachKestrelUntilBufferFilled();
+
+        EmitItem item = _emitBuffer.poll();
+        if(item != null) { 
+            _collector.emit(item.tuple, item.sourceId);
+        } else {  // If buffer is still empty here, then every kestrel Q is also empty.
+            Utils.sleep(10); 
         }
     }
-    
+
     private void blacklist(KestrelClientInfo info, Throwable t) {
         LOG.warn("Failed to read from Kestrel at " + info.host + ":" + info.port, t);
-        try {
-          //this case can happen when it fails to connect to Kestrel (and so never stores the connection)
-          if(info.client!=null) {
-            info.client.close();
-          }
-        } catch (IOException ex) {
-            LOG.warn("Failed to close Kestrel client at " + info.host + ":" + info.port, t);
-        }
-        info.client = null;
+
+        //this case can happen when it fails to connect to Kestrel (and so never stores the connection)
+        info.closeClient();
         info.blacklistTillTimeMs = System.currentTimeMillis() + BLACKLIST_TIME_MS;
+
+        int index = _kestrels.indexOf(info);
+
+        // we just closed the connection, so all open reliable reads will be aborted. empty buffers.
+        for(Iterator<EmitItem> i = _emitBuffer.iterator(); i.hasNext();) {
+            EmitItem item = i.next();
+            if(item.sourceId.index == index) i.remove();
+        }
     }
 
     public void ack(Object msgId) {
@@ -171,11 +227,11 @@ public class KestrelSpout implements IRichSpout {
         //back on the queue
         try {
             if(info.client!=null) {
-                info.client.ack(_queueName, sourceId.id);
+                HashSet xids = new HashSet();
+                xids.add(sourceId.id);
+                info.client.confirm(_queueName, xids);
             }
-        } catch(IOException ioe) {
-            blacklist(info, ioe);
-        } catch(ParseError e) {
+        } catch(TException e) {
             blacklist(info, e);            
         }
     }
@@ -187,11 +243,11 @@ public class KestrelSpout implements IRichSpout {
         // see not above about why this works with blacklisting strategy
         try {
             if(info.client!=null) {
-                info.client.fail(_queueName, sourceId.id);
+                HashSet xids = new HashSet();
+                xids.add(sourceId.id);
+                info.client.abort(_queueName, xids);
             }
-        } catch(IOException ioe) {
-            blacklist(info, ioe);
-        } catch(ParseError e) {
+        } catch(TException e) {
             blacklist(info, e);            
         }
     }
